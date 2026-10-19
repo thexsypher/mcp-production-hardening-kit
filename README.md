@@ -124,4 +124,135 @@ Four of the eight primary failure modes in production MCP deployments are **supp
 
 ---
 
-## 🔧 The 5
+## 🔧 The 5-Step Production Hardening Order
+
+Below are the core implementation primitives from this repository. *(For complete Kubernetes YAML manifests, `runc` vs `gVisor` vs `Firecracker` latency benchmarks, and operational failure drills, [**read the full engineering guide on xSypher**](https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production)).*
+
+### 1. Per-Server OAuth 2.1 Identity (Zero Token Passthrough)
+One shared audience string for every MCP server is the same as no audience validation at all. Under the MCP OAuth 2.1 authorization spec (RFC 8707 / RFC 9728), servers **MUST** validate that tokens were minted specifically for them and **MUST NOT** forward client tokens upstream:
+
+```python
+import jwt
+from jwt import PyJWKClient
+
+ISSUER = "[https://auth.example.com/](https://auth.example.com/)"
+# Per-server URI (RFC 8707) — NEVER a single shared platform-wide audience
+AUDIENCE = "[https://mcp-deploy.internal.example](https://mcp-deploy.internal.example)"
+
+jwks_client = PyJWKClient(f"{ISSUER}.well-known/jwks.json")
+
+def verify_mcp_bearer(token: str) -> dict:
+    signing_key = jwks_client.get_signing_key_from_jwt(token).key
+    return jwt.decode(
+        token,
+        key=signing_key,
+        algorithms=["RS256"],  # Reject "none" and symmetric HS* keys
+        audience=AUDIENCE,
+        issuer=ISSUER,
+        options={"require": ["exp", "aud", "iss", "sub"]},
+    )
+```
+
+### 2. Container & Runtime Sandboxing
+Treat every MCP server like untrusted third-party code. Drop all capabilities, enforce a read-only root filesystem with a `noexec` scratchpad, cap PIDs/memory, and pin by immutable digest:
+
+```bash
+docker run --rm \
+  --name mcp-github \
+  --network mcp-egress-restricted \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 128 \
+  --memory 512m --cpus 1 \
+  --user 10001:10001 \
+  registry.internal/mcp-github@sha256:<digest>
+```
+> 💡 ** Choosing an Isolation Boundary (`runc` vs `gVisor` vs `Firecracker`):** Standard `runc` containers share the host Linux kernel. To see our 8-vCPU x86 cold-start overhead benchmarks and complete Kubernetes Default-Deny `NetworkPolicy` YAML (blocking `169.254.169.254`), [**view Section 4 of the full article →**](https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production)
+
+### 3. Supply-Chain & SHA-256 Manifest Pinning
+A rug-pull update alters a tool's description text while the package version increment looks routine. Hash the canonical `name`, `description`, and `inputSchema` of every tool and fail closed on mismatch:
+
+```python
+import hashlib, json
+
+def tool_fingerprint(tool: dict) -> str:
+    canonical = json.dumps(
+        {k: tool.get(k) for k in ("name", "description", "inputSchema")},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+def enforce_pinned_manifest(tools: list[dict], pinned_hashes: dict[str, str]) -> list[dict]:
+    verified = []
+    for tool in tools:
+        fp = tool_fingerprint(tool)
+        if pinned_hashes.get(tool["name"]) != fp:
+            raise RuntimeError(f"Blocked unreviewed tool schema change: {tool['name']} ({fp})")
+        verified.append(tool)
+    return verified
+```
+
+### 4. Calibrating the Policy Broker & HITL Gate
+An approval gate that fires constantly is a logging feature, not a control:
+
+```text
+❌ Naive Policy (Confirm Every Write)  ──►  63 Prompts / Hour  ──►  Reviewer Reflex-Approves in 15m
+✅ xSypher Calibrated Broker Policy    ──►  ~4–5 Prompts / Hour ──►  High-Signal Human Review
+```
+* **Broker Enforced Automatically:** Tool allowlists per agent instance, JSON Schema `2020-12` argument ceilings (e.g., refund caps, path prefixes), and session rate limits.
+* **Gated for Out-of-Band Human Approval:** Deletes, payments, outbound email to external domains, production deploys, and permission changes.
+
+### 5. High-Signal Telemetry (The Sleeper Field: `result_size`)
+Verbose argument logging on a chatty agent easily exceeds **2 GB/day** per staging deployment. Sample low-risk tools, redact secrets **at the emitter** (before they hit your log pipeline), and alert on **`result_size` outliers**—data exfiltration shows up as a **40x payload volume spike** long before anyone inspects payload contents.
+
+---
+
+## ✅ Production Gate Checklist (Pre-Flight Review)
+
+Before any AI agent touches production data, verify every row in this gate:
+
+| Hardening Check | Production Pass Condition | Status |
+| :--- | :--- | :---: |
+| **Token Audience (`aud`)** | Per-server URI validated via RFC 8707; `none` and symmetric `HS*` algorithms rejected | ⬜ |
+| **Token Passthrough** | Server obtains its own upstream token; client bearer token is **never** forwarded | ⬜ |
+| **Permission Scopes** | Narrowest read/write scope required for the task; zero wildcard admin grants | ⬜ |
+| **Runtime Sandbox** | Non-root UID, `--read-only` rootfs with `64m noexec /tmp`, all capabilities dropped, gVisor/Firecracker for code execution | ⬜ |
+| **Network Egress** | Default-deny `NetworkPolicy` with reviewed hostname allowlist and `169.254.169.254` blocked | ⬜ |
+| **Supply Chain & Pinning** | Digest-pinned images, private registry mirror, and `SHA-256` tool manifest hash verified on load | ⬜ |
+| **Policy Broker** | Deterministic tool allowlist plus JSON Schema `2020-12` argument/output constraints in version control | ⬜ |
+| **Human Approval Gate** | Out-of-band approval for irreversible/high-value actions only; prompt volume under `~5/hour` | ⬜ |
+| **Audit Logging** | Human principal, tool name, broker decision, and response payload size captured and redacted at the emitter | ⬜ |
+| **Kill Switch & Blast Radius** | Single token/session revocation path tested in the last 30 days; worst-case adversarial impact documented | ⬜ |
+
+---
+
+## 🔗 Deep-Dive Resources & Full Engineering Guide
+
+This repository contains the summary architecture and core verification snippets. For the complete production breakdown, visit **xSypher**:
+
+* 📘 **[Full Guide: How to Secure MCP Servers and AI Agents in Production](https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production)** — *Includes Kubernetes Egress YAML, Isolation Cold-Start Benchmarks, Provenance Tagging, and Production FAQ.*
+* 🧠 **[Why AI Hallucinates and How to Catch It Before It Costs You](https://xsypher.com)**
+* 💻 **[Local AI vs Cloud AI: Which One Fits Your Work?](https://xsypher.com)**
+
+---
+
+## ✍️ Author & Attribution
+
+Research, bench testing, and architecture by **Anwar Iqbal Dawar** — *Founder & Editor-in-Chief at [xSypher](https://xsypher.com) | Technology & Security Analyst specializing in DevSecOps, Linux Security, and Cloud Architecture.*
+
+If you use this hardening methodology or reference matrix in your security reviews, please cite:
+```bibtex
+@article{dawar2026mcp,
+  title   = {How to Secure MCP Servers and AI Agents in Production},
+  author  = {Dawar, Anwar Iqbal},
+  journal = {xSypher Security Lab},
+  year    = {2026},
+  month   = {October},
+  url     = {[https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production](https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production)}
+}
+```
+
+## 📄 License
+Released under the [MIT License](LICENSE) by [**xSypher Security Lab**](https://xsypher.com).
