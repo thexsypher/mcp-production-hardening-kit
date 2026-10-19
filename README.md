@@ -1,2 +1,6 @@
-# mcp-production-hardening-kit
-Production security controls for Model Context Protocol (MCP) servers &amp; AI agents: OAuth 2.1 audience verification, SHA-256 tool manifest pinning, gVisor/Firecracker sandboxing, and Kubernetes default-deny egress.
+# 🛡️ MCP Production Hardening Kit
+
+> **Reference Architecture & Production Controls for Hardening Model Context Protocol (MCP) Servers and Autonomous AI Agents.**  
+> 📖 **Read the full engineering deep-dive:** [**How to Secure MCP Servers and AI Agents in Production (xSypher)**](https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production)
+
+For the complete implementation details, OWASP mappings, and configuration code blocks, please visit the {Link: xSypher Article https://xsypher.com/article/how-to-secure-mcp-servers-and-ai-agents-in-production}.
